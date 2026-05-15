@@ -897,8 +897,6 @@ onMounted(() => {
   presenceInterval = setInterval(subscribePresenceForTopChats, 60000);
 });
 
-watch(conversationList, subscribePresenceForTopChats);
-
 watch(assigneeTabItems, items => {
   if (!items.some(item => item.key === activeAssigneeTab.value)) {
     updateAssigneeTab(wootConstants.ASSIGNEE_TYPE.ME);
