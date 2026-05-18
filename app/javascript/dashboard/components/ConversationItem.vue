@@ -2,6 +2,7 @@
 import { computed, ref, watch, inject } from 'vue';
 import { useRouter } from 'vue-router';
 import { useStore, useMapGetter } from 'dashboard/composables/store';
+import { useI18n } from 'vue-i18n';
 import { frontendURL, conversationUrl } from 'dashboard/helper/URLHelper';
 import ConversationCard from './widgets/conversation/ConversationCard.vue';
 import ConversationCardExpanded from 'dashboard/components-next/Conversation/ConversationCard/ConversationCardExpanded.vue';
@@ -51,10 +52,13 @@ watch(
   }
 );
 
+const { t } = useI18n();
+
 const currentChat = useMapGetter('getSelectedChat');
 const inboxesList = useMapGetter('inboxes/getInboxes');
 const activeInbox = useMapGetter('getSelectedInbox');
 const accountId = useMapGetter('getCurrentAccountId');
+const globalConfig = useMapGetter('globalConfig/get');
 
 const chatMetadata = computed(() => props.source.meta || {});
 const assignee = computed(() => chatMetadata.value.assignee || {});
@@ -78,6 +82,32 @@ const isInboxView = computed(() => !!activeInbox.value);
 const showAssigneeForExpandedCard = computed(
   () => props.showExpanded || props.showAssignee
 );
+
+const typingUsersList = computed(() => {
+  const users = store.getters['conversationTypingStatus/getUserList'](
+    props.source.id
+  );
+  return users.filter(u => u.type === 'contact');
+});
+const typingPreviewText = computed(() => {
+  if (typingUsersList.value.length === 0) return '';
+  return typingUsersList.value.some(u => u.recording)
+    ? t('CHAT_LIST.RECORDING')
+    : t('CHAT_LIST.TYPING');
+});
+
+const isGroupsDisabled = computed(
+  () =>
+    props.source.group_type === 'group' &&
+    !globalConfig.value.baileysWhatsappGroupsEnabled
+);
+
+const hasGroupActivity = computed(() => {
+  if (!isGroupsDisabled.value) return false;
+  const lastActivity = props.source.last_activity_at;
+  const agentSeen = props.source.agent_last_seen_at;
+  return lastActivity > 0 && (!agentSeen || lastActivity > agentSeen);
+});
 
 const conversationPath = computed(() =>
   frontendURL(
@@ -208,6 +238,8 @@ const onDeleteConversation = () => {
     :is-active-chat="isActiveChat"
     :show-assignee="showAssignee"
     :show-inbox-name="showInboxName"
+    :typing-preview="typingPreviewText"
+    :has-group-activity="hasGroupActivity"
     @click="onCardClick"
     @contextmenu="openContextMenu"
     @select-conversation="selectConversation"

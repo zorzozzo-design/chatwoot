@@ -303,7 +303,7 @@ RSpec.describe 'Accounts API', type: :request do
       end
 
       it 'clears onboarding step when current value is account_details' do
-        account.update(custom_attributes: { onboarding_step: 'account_details' })
+        account.update!(custom_attributes: { onboarding_step: 'account_details' })
         patch "/api/v1/accounts/#{account.id}",
               params: params,
               headers: admin.create_new_auth_token,
