@@ -20,10 +20,10 @@ RSpec.describe SendReplyJob do
 
     def expect_mapped_service_to_perform(message, service_class_name)
       channel_name = message.conversation.inbox.channel.class.name
-      service_class = described_class::CHANNEL_SERVICES.fetch(channel_name)
+      mapped_class_name = described_class::CHANNEL_SERVICES.fetch(channel_name)
 
-      expect(service_class.name).to eq(service_class_name)
-      expect(service_class).to receive(:new).with(message: message).and_return(process_service)
+      expect(mapped_class_name).to eq("::#{service_class_name}")
+      expect(mapped_class_name.constantize).to receive(:new).with(message: message).and_return(process_service)
       expect(process_service).to receive(:perform)
 
       described_class.perform_now(message.id)
