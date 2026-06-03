@@ -379,6 +379,90 @@ describe Whatsapp::IncomingMessageWhatsappCloudService do
     end
   end
 
+  describe '#perform with a click-to-WhatsApp ad referral' do
+    # The service clears its own dedupe key in an ensure; this is a safety net for
+    # any path that bails before the lock, scoped to this inbox so it can't wipe
+    # keys other specs are using against the same Redis DB.
+    after do
+      Redis::Alfred.scan_each(match: "MESSAGE_SOURCE_KEY::#{whatsapp_channel.inbox.id}_*") { |key| Redis::Alfred.delete(key) }
+    end
+
+    let!(:whatsapp_channel) { create(:channel_whatsapp, provider: 'whatsapp_cloud', sync_templates: false, validate_provider_config: false) }
+    let(:referral) do
+      {
+        source_url: 'https://fb.me/abc123', source_id: '120210000000000', source_type: 'ad',
+        headline: 'Promo de Inverno', body: '50% OFF em tudo', media_type: 'image',
+        image_url: 'https://example.com/ad-thumb.jpg', ctwa_clid: 'ARAaCtwaClid123'
+      }
+    end
+
+    def referral_params(message)
+      {
+        phone_number: whatsapp_channel.phone_number,
+        object: 'whatsapp_business_account',
+        entry: [{ changes: [{ value: {
+          contacts: [{ profile: { name: 'Lead Anúncio' }, wa_id: '2423423243' }],
+          messages: [message]
+        } }] }]
+      }.with_indifferent_access
+    end
+
+    context 'when a text message carries a referral object' do
+      it 'persists the referral on the message and the conversation' do
+        message = { from: '2423423243', id: 'wamid.ad1', timestamp: '1664799904', type: 'text',
+                    text: { body: 'Oi, vi o anúncio' }, referral: referral }
+
+        described_class.new(inbox: whatsapp_channel.inbox, params: referral_params(message)).perform
+
+        created = whatsapp_channel.inbox.messages.last
+        expect(created.content).to eq('Oi, vi o anúncio')
+        expect(created.content_attributes['referral']).to include(
+          'source_type' => 'ad', 'source_id' => '120210000000000', 'source_url' => 'https://fb.me/abc123',
+          'ctwa_clid' => 'ARAaCtwaClid123', 'title' => 'Promo de Inverno', 'body' => '50% OFF em tudo',
+          'media_type' => 'image', 'thumbnail_url' => 'https://example.com/ad-thumb.jpg'
+        )
+        expect(created.conversation.additional_attributes['referral']).to include('ctwa_clid' => 'ARAaCtwaClid123')
+      end
+    end
+
+    context 'when a request_welcome message carries a referral object' do
+      it 'is not skipped and creates a renderable message from the ad headline' do
+        message = { from: '2423423243', id: 'wamid.welcome1', timestamp: '1664799904', type: 'request_welcome', referral: referral }
+
+        expect do
+          described_class.new(inbox: whatsapp_channel.inbox, params: referral_params(message)).perform
+        end.to change(whatsapp_channel.inbox.messages, :count).by(1)
+
+        created = whatsapp_channel.inbox.messages.last
+        expect(created.content).to eq('Promo de Inverno')
+        expect(created.content_attributes['referral']).to include('ctwa_clid' => 'ARAaCtwaClid123')
+        expect(created.conversation.additional_attributes['referral']).to include('ctwa_clid' => 'ARAaCtwaClid123')
+      end
+    end
+
+    context 'when a referral arrives on an existing conversation' do
+      it 'backfills missing attribution and preserves the first touch thereafter' do
+        plain = { from: '2423423243', id: 'wamid.plain1', timestamp: '1664799904', type: 'text', text: { body: 'oi' } }
+        described_class.new(inbox: whatsapp_channel.inbox, params: referral_params(plain)).perform
+        conversation = whatsapp_channel.inbox.messages.last.conversation
+        expect(conversation.additional_attributes['referral']).to be_nil
+
+        ad = { from: '2423423243', id: 'wamid.ad2', timestamp: '1664799999', type: 'text',
+               text: { body: 'agora vi o anúncio' }, referral: referral }
+        described_class.new(inbox: whatsapp_channel.inbox, params: referral_params(ad)).perform
+
+        expect(conversation.reload.additional_attributes['referral']).to include('ctwa_clid' => 'ARAaCtwaClid123')
+
+        later_referral = referral.merge(ctwa_clid: 'DIFFERENT_CLID', source_id: '999999999999999')
+        later_ad = { from: '2423423243', id: 'wamid.ad3', timestamp: '1664800000', type: 'text',
+                     text: { body: 'outro anúncio' }, referral: later_referral }
+        described_class.new(inbox: whatsapp_channel.inbox, params: referral_params(later_ad)).perform
+
+        expect(conversation.reload.additional_attributes['referral']).to include('ctwa_clid' => 'ARAaCtwaClid123', 'source_id' => '120210000000000')
+      end
+    end
+  end
+
   # Métodos auxiliares para reduzir o tamanho do exemplo
 
   def stub_media_url_request

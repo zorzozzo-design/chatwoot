@@ -845,4 +845,147 @@ describe Whatsapp::BaileysHandlers::MessagesUpsert do
         .not_to raise_error
     end
   end
+
+  describe 'click-to-WhatsApp ad referral and entry-point handling' do
+    let(:phone) { '5511912345678' }
+    let(:external_ad_reply) do
+      {
+        title: 'Promo de Inverno',
+        body: '50% OFF em tudo',
+        mediaType: 'IMAGE',
+        thumbnailUrl: 'https://example.com/ad-thumb.jpg',
+        sourceType: 'ad',
+        sourceId: '120210000000000',
+        sourceUrl: 'https://fb.me/abc123',
+        ctwaClid: 'ARAaCtwaClid123'
+      }
+    end
+    let(:lid) { '12345678' }
+
+    # Scope the dedupe cleanup to this inbox so it can't wipe keys other specs
+    # are using against the same Redis DB.
+    after do
+      Redis::Alfred.scan_each(match: "MESSAGE_SOURCE_KEY::#{inbox.id}_*") { |key| Redis::Alfred.delete(key) }
+    end
+
+    # Each example needs a distinct id so the MESSAGE_SOURCE_KEY dedupe doesn't
+    # short-circuit later examples based on execution order.
+    def ad_params(message, id:)
+      raw_message = {
+        key: { id: id, remoteJid: "#{phone}@s.whatsapp.net", remoteJidAlt: "#{lid}@lid", fromMe: false, addressingMode: 'pn' },
+        pushName: 'Lead Anúncio',
+        messageTimestamp: timestamp,
+        message: message
+      }
+      { webhookVerifyToken: webhook_verify_token, event: 'messages.upsert', data: { type: 'notify', messages: [raw_message] } }
+    end
+
+    context 'when a text message carries an externalAdReply' do
+      it 'persists the referral on the message and the conversation' do
+        params = ad_params(
+          { extendedTextMessage: { text: 'Oi, vi o anúncio', contextInfo: { externalAdReply: external_ad_reply } } },
+          id: 'ad_msg_text_1'
+        )
+
+        expect do
+          Whatsapp::IncomingMessageBaileysService.new(inbox: inbox, params: params).perform
+        end.to change(inbox.messages, :count).by(1)
+
+        message = inbox.messages.last
+        expect(message.content).to eq('Oi, vi o anúncio')
+        expect(message.content_attributes['referral']).to include(
+          'source_type' => 'ad', 'source_id' => '120210000000000', 'source_url' => 'https://fb.me/abc123',
+          'ctwa_clid' => 'ARAaCtwaClid123', 'title' => 'Promo de Inverno', 'body' => '50% OFF em tudo',
+          'media_type' => 'image', 'thumbnail_url' => 'https://example.com/ad-thumb.jpg'
+        )
+        expect(message.conversation.additional_attributes['referral']).to include('ctwa_clid' => 'ARAaCtwaClid123')
+      end
+    end
+
+    context 'when an ad-click message has no text body' do
+      it 'still creates a renderable message using the ad headline as content' do
+        params = ad_params(
+          { extendedTextMessage: { contextInfo: { externalAdReply: external_ad_reply } } },
+          id: 'ad_msg_headline_fallback_1'
+        )
+
+        expect do
+          Whatsapp::IncomingMessageBaileysService.new(inbox: inbox, params: params).perform
+        end.to change(inbox.messages, :count).by(1)
+
+        message = inbox.messages.last
+        expect(message.is_unsupported).to be_falsey
+        expect(message.content).to eq('Promo de Inverno')
+        expect(message.content_attributes['referral']).to include('ctwa_clid' => 'ARAaCtwaClid123')
+      end
+    end
+
+    context 'when externalAdReply mediaType is the numeric proto enum' do
+      it 'maps the enum number to the string media type' do
+        ad = external_ad_reply.merge(mediaType: 2)
+        params = ad_params(
+          { extendedTextMessage: { text: 'oi', contextInfo: { externalAdReply: ad } } },
+          id: 'ad_msg_numeric_media_1'
+        )
+
+        Whatsapp::IncomingMessageBaileysService.new(inbox: inbox, params: params).perform
+
+        expect(inbox.messages.last.content_attributes.dig('referral', 'media_type')).to eq('video')
+      end
+    end
+
+    context 'when the message comes from a click-to-chat link (no ad)' do
+      it 'records the entry point on the conversation without a referral or card' do
+        params = ad_params(
+          { extendedTextMessage: {
+            text: 'oi',
+            contextInfo: { entryPointConversionSource: 'click_to_chat_link', entryPointConversionApp: '' }
+          } },
+          id: 'ad_msg_entry_point_1'
+        )
+
+        expect do
+          Whatsapp::IncomingMessageBaileysService.new(inbox: inbox, params: params).perform
+        end.to change(inbox.messages, :count).by(1)
+
+        message = inbox.messages.last
+        expect(message.content).to eq('oi')
+        expect(message.content_attributes['referral']).to be_nil
+        expect(message.conversation.additional_attributes['referral']).to be_nil
+        expect(message.conversation.additional_attributes['entry_point']).to eq('source' => 'click_to_chat_link')
+      end
+    end
+
+    context 'when a later message reuses the conversation' do
+      it 'preserves the original ad attribution (first touch wins)' do
+        first = ad_params(
+          { extendedTextMessage: { text: 'Oi, vi o anúncio', contextInfo: { externalAdReply: external_ad_reply } } },
+          id: 'ad_msg_first_touch_1'
+        )
+        follow_up = ad_params({ extendedTextMessage: { text: 'seguindo a conversa' } }, id: 'ad_msg_first_touch_2')
+
+        Whatsapp::IncomingMessageBaileysService.new(inbox: inbox, params: first).perform
+        conversation = inbox.messages.last.conversation
+        Whatsapp::IncomingMessageBaileysService.new(inbox: inbox, params: follow_up).perform
+
+        expect(conversation.reload.additional_attributes['referral']).to include('ctwa_clid' => 'ARAaCtwaClid123')
+      end
+
+      it 'backfills attribution when the reused conversation had none' do
+        plain = ad_params({ extendedTextMessage: { text: 'oi, tudo bem?' } }, id: 'ad_msg_backfill_1')
+        ad = ad_params(
+          { extendedTextMessage: { text: 'agora vi o anúncio', contextInfo: { externalAdReply: external_ad_reply } } },
+          id: 'ad_msg_backfill_2'
+        )
+
+        Whatsapp::IncomingMessageBaileysService.new(inbox: inbox, params: plain).perform
+        conversation = inbox.messages.last.conversation
+        expect(conversation.additional_attributes['referral']).to be_nil
+
+        Whatsapp::IncomingMessageBaileysService.new(inbox: inbox, params: ad).perform
+
+        expect(conversation.reload.additional_attributes['referral']).to include('ctwa_clid' => 'ARAaCtwaClid123')
+      end
+    end
+  end
 end
