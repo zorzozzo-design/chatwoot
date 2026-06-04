@@ -30,12 +30,30 @@ module Whatsapp::BaileysHandlers::MessagesUpsert
     @lock_acquired = false
 
     return handle_message_stub if message_stub?
+    return handle_revoke if protocol_revoke?
 
     return if ignore_message?
     return if find_message_by_source_id(raw_message_id)
 
+    route_contact_message
+  end
+
+  def route_contact_message
     return handle_individual_contact_message if %w[lid user].include?(jid_type)
     return handle_group_contact_message if jid_type == 'group' && Whatsapp::Providers::WhatsappBaileysService.groups_enabled?
+  end
+
+  # The contact deleted a message for everyone. Keep the stored content and only
+  # flag it as deleted by the contact so the UI can mark it while staying readable.
+  # NOTE: If the revoke webhook somehow arrives before the original message is
+  # processed, find_message_by_source_id returns nil and the revoke becomes a
+  # no-op; the original is later created without the flag. WhatsApp delivers
+  # webhooks in order so this is rare and accepted; persisting pending revokes
+  # would require updating this flagging logic.
+  def handle_revoke
+    return unless find_message_by_source_id(protocol_revoke_target_id)
+
+    @message.update!(deleted_by_contact: true)
   end
 
   def message_stub?
