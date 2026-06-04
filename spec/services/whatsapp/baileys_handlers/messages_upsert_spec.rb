@@ -988,4 +988,282 @@ describe Whatsapp::BaileysHandlers::MessagesUpsert do
       end
     end
   end
+
+  describe 'rich message handling' do
+    let(:phone) { '5511912345678' }
+    let(:lid) { '12345678' }
+
+    after do
+      Redis::Alfred.scan_each(match: "MESSAGE_SOURCE_KEY::#{inbox.id}_*") { |key| Redis::Alfred.delete(key) }
+    end
+
+    def rich_params(message, id:)
+      raw_message = {
+        key: { id: id, remoteJid: "#{phone}@s.whatsapp.net", remoteJidAlt: "#{lid}@lid", fromMe: false, addressingMode: 'pn' },
+        pushName: 'Acme Payments',
+        messageTimestamp: timestamp,
+        message: message
+      }
+      { webhookVerifyToken: webhook_verify_token, event: 'messages.upsert', data: { type: 'notify', messages: [raw_message] } }
+    end
+
+    context 'when receiving a hydrated template message' do
+      it 'stores the text content and the structured rich payload, not unsupported' do
+        params = rich_params(
+          { templateMessage: { hydratedTemplate: {
+            hydratedContentText: 'Your invoice is ready.', hydratedFooterText: 'Reply STOP to opt out.',
+            hydratedButtons: [{ urlButton: { displayText: 'Pay now', url: 'https://acme.io/pay' } }]
+          } }, messageContextInfo: { deviceListMetadataVersion: 2 } },
+          id: 'rich_tpl_1'
+        )
+
+        expect do
+          Whatsapp::IncomingMessageBaileysService.new(inbox: inbox, params: params).perform
+        end.to change(inbox.messages, :count).by(1)
+
+        message = inbox.messages.last
+        expect(message.is_unsupported).to be_falsey
+        expect(message.content).to eq("Your invoice is ready.\n\nReply STOP to opt out.\n\n▸ Pay now: https://acme.io/pay")
+        expect(message.content_attributes['rich']).to include(
+          'type' => 'template', 'body' => 'Your invoice is ready.', 'footer' => 'Reply STOP to opt out.',
+          'buttons' => [{ 'text' => 'Pay now', 'url' => 'https://acme.io/pay' }]
+        )
+      end
+    end
+
+    context 'when a template carries an externalAdReply (CTWA)' do
+      it 'captures the referral with the numeric proto media type mapped' do
+        params = rich_params(
+          { templateMessage: { hydratedTemplate: { hydratedContentText: 'Promo' },
+                               contextInfo: { externalAdReply: { title: 'Ad', mediaType: 2, ctwaClid: 'CLID1' } } } },
+          id: 'rich_tpl_ad_1'
+        )
+
+        Whatsapp::IncomingMessageBaileysService.new(inbox: inbox, params: params).perform
+
+        message = inbox.messages.last
+        expect(message.content_attributes['rich']).to include('type' => 'template', 'body' => 'Promo')
+        expect(message.content_attributes['referral']).to include('ctwa_clid' => 'CLID1', 'media_type' => 'video')
+      end
+    end
+
+    context 'when the rich message quotes another message' do
+      it 'anchors the reply to the quoted message' do
+        contact = create(:contact, account: inbox.account, phone_number: "+#{phone}", identifier: "#{lid}@lid")
+        contact_inbox = create(:contact_inbox, inbox: inbox, contact: contact, source_id: lid)
+        conversation = create(:conversation, inbox: inbox, contact_inbox: contact_inbox)
+        original = create(:message, inbox: inbox, conversation: conversation, source_id: 'QUOTED_RICH_1')
+
+        params = rich_params(
+          { templateMessage: { hydratedTemplate: { hydratedContentText: 'Re: your order' },
+                               contextInfo: { stanzaId: 'QUOTED_RICH_1' } } },
+          id: 'rich_reply_1'
+        )
+
+        Whatsapp::IncomingMessageBaileysService.new(inbox: inbox, params: params).perform
+
+        reply = conversation.messages.last
+        expect(reply.in_reply_to).to eq(original.id)
+        expect(reply.in_reply_to_external_id).to eq('QUOTED_RICH_1')
+      end
+    end
+
+    context 'when receiving an interactive nativeFlow message' do
+      it 'parses the cta_url button from the snake_case params json' do
+        params = rich_params(
+          { interactiveMessage: { body: { text: 'Pick one' },
+                                  nativeFlowMessage: { buttons: [
+                                    { name: 'cta_url', buttonParamsJson: '{"display_text":"Buy","url":"https://b.io"}' }
+                                  ] } } },
+          id: 'rich_interactive_1'
+        )
+
+        Whatsapp::IncomingMessageBaileysService.new(inbox: inbox, params: params).perform
+
+        message = inbox.messages.last
+        expect(message.is_unsupported).to be_falsey
+        expect(message.content).to eq("Pick one\n\n▸ Buy: https://b.io")
+        expect(message.content_attributes.dig('rich', 'buttons')).to eq([{ 'text' => 'Buy', 'url' => 'https://b.io' }])
+      end
+    end
+
+    context 'when the rich message has no renderable content' do
+      it 'marks the message as unsupported' do
+        params = rich_params({ interactiveMessage: {} }, id: 'rich_empty_1')
+
+        Whatsapp::IncomingMessageBaileysService.new(inbox: inbox, params: params).perform
+
+        message = inbox.messages.last
+        expect(message.is_unsupported).to be(true)
+        expect(message.content).to be_nil
+      end
+    end
+
+    context 'when a template has a media header alongside text' do
+      it 'attaches the header media and keeps the rich card' do
+        params = rich_params(
+          { templateMessage: { hydratedTemplate: {
+            hydratedContentText: 'Segue a fatura em anexo.',
+            documentMessage: { mimetype: 'application/pdf', fileName: 'fatura.pdf' }
+          } } },
+          id: 'rich_tpl_media_1'
+        )
+        stub_request(:get, whatsapp_channel.media_url('rich_tpl_media_1')).to_return(status: 200, body: 'fake pdf')
+
+        Whatsapp::IncomingMessageBaileysService.new(inbox: inbox, params: params).perform
+
+        message = inbox.messages.last
+        expect(message.is_unsupported).to be_falsey
+        expect(message.content_attributes['rich']).to include('body' => 'Segue a fatura em anexo.')
+        expect(message.attachments.count).to eq(1)
+        expect(message.attachments.first.file_type).to eq('file')
+        expect(message.attachments.first.file.filename.to_s).to eq('fatura.pdf')
+      end
+    end
+
+    context 'when a template is only a media header (no text/buttons)' do
+      it 'attaches the media and does not mark the message unsupported' do
+        params = rich_params(
+          { templateMessage: { hydratedTemplate: { imageMessage: { mimetype: 'image/jpeg' } } } },
+          id: 'rich_tpl_media_only_1'
+        )
+        stub_request(:get, whatsapp_channel.media_url('rich_tpl_media_only_1')).to_return(status: 200, body: 'fake image')
+
+        Whatsapp::IncomingMessageBaileysService.new(inbox: inbox, params: params).perform
+
+        message = inbox.messages.last
+        expect(message.is_unsupported).to be_falsey
+        expect(message.content).to be_nil
+        expect(message.content_attributes['rich']).to be_nil
+        expect(message.attachments.count).to eq(1)
+        expect(message.attachments.first.file_type).to eq('image')
+      end
+    end
+
+    context 'when receiving a poll' do
+      it 'renders the question and options as a rich card' do
+        params = rich_params(
+          { pollCreationMessage: { name: 'Qual horário?', options: [{ optionName: 'Manhã' }, { optionName: 'Tarde' }] } },
+          id: 'rich_poll_1'
+        )
+
+        Whatsapp::IncomingMessageBaileysService.new(inbox: inbox, params: params).perform
+
+        message = inbox.messages.last
+        expect(message.is_unsupported).to be_falsey
+        expect(message.content).to eq("Qual horário?\n\n▸ Manhã\n\n▸ Tarde")
+        expect(message.content_attributes['rich']).to include('type' => 'poll', 'title' => 'Qual horário?')
+      end
+    end
+  end
+
+  describe 'location message handling' do
+    let(:phone) { '5511912345678' }
+    let(:lid) { '12345678' }
+
+    after do
+      Redis::Alfred.scan_each(match: "MESSAGE_SOURCE_KEY::#{inbox.id}_*") { |key| Redis::Alfred.delete(key) }
+    end
+
+    def loc_params(message, id:)
+      raw = { key: { id: id, remoteJid: "#{phone}@s.whatsapp.net", remoteJidAlt: "#{lid}@lid", fromMe: false, addressingMode: 'pn' },
+              pushName: 'Lead', messageTimestamp: timestamp, message: message }
+      { webhookVerifyToken: webhook_verify_token, event: 'messages.upsert', data: { type: 'notify', messages: [raw] } }
+    end
+
+    it 'persists a native location attachment (real shape: coordinates only)' do
+      params = loc_params({ locationMessage: { degreesLatitude: -18.9202171, degreesLongitude: -48.2694733 } }, id: 'loc_1')
+
+      Whatsapp::IncomingMessageBaileysService.new(inbox: inbox, params: params).perform
+
+      message = inbox.messages.last
+      expect(message.is_unsupported).to be_falsey
+      attachment = message.attachments.first
+      expect(attachment.file_type).to eq('location')
+      expect(attachment.coordinates_lat).to eq(-18.9202171)
+      expect(attachment.coordinates_long).to eq(-48.2694733)
+    end
+
+    it 'uses name/address as the fallback title and keeps the place url' do
+      params = loc_params(
+        { locationMessage: { degreesLatitude: -23.5, degreesLongitude: -46.6, name: 'Padaria', address: 'Rua X, 1',
+                             url: 'https://maps.example/p' } },
+        id: 'loc_2'
+      )
+
+      Whatsapp::IncomingMessageBaileysService.new(inbox: inbox, params: params).perform
+
+      attachment = inbox.messages.last.attachments.first
+      expect(attachment.fallback_title).to eq('Padaria, Rua X, 1')
+      expect(attachment.external_url).to eq('https://maps.example/p')
+    end
+
+    it 'anchors the reply when the location quotes another message' do
+      contact = create(:contact, account: inbox.account, phone_number: "+#{phone}", identifier: "#{lid}@lid")
+      contact_inbox = create(:contact_inbox, inbox: inbox, contact: contact, source_id: lid)
+      conversation = create(:conversation, inbox: inbox, contact_inbox: contact_inbox)
+      original = create(:message, inbox: inbox, conversation: conversation, source_id: 'QUOTED_LOC_1')
+
+      params = loc_params(
+        { locationMessage: { degreesLatitude: -23.5, degreesLongitude: -46.6, contextInfo: { stanzaId: 'QUOTED_LOC_1' } } },
+        id: 'loc_reply_1'
+      )
+
+      Whatsapp::IncomingMessageBaileysService.new(inbox: inbox, params: params).perform
+
+      reply = conversation.messages.last
+      expect(reply.in_reply_to).to eq(original.id)
+      expect(reply.in_reply_to_external_id).to eq('QUOTED_LOC_1')
+    end
+  end
+
+  describe 'contact message handling' do
+    let(:phone) { '5511912345678' }
+    let(:lid) { '12345678' }
+    let(:vcard) { "BEGIN:VCARD\nVERSION:3.0\nFN:Algar\nTEL;type=Mobile;waid=553498840123:+55 34 9884-0123\nEND:VCARD" }
+
+    after do
+      Redis::Alfred.scan_each(match: "MESSAGE_SOURCE_KEY::#{inbox.id}_*") { |key| Redis::Alfred.delete(key) }
+    end
+
+    def contact_params(message, id:)
+      raw = { key: { id: id, remoteJid: "#{phone}@s.whatsapp.net", remoteJidAlt: "#{lid}@lid", fromMe: false, addressingMode: 'pn' },
+              pushName: 'Lead', messageTimestamp: timestamp, message: message }
+      { webhookVerifyToken: webhook_verify_token, event: 'messages.upsert', data: { type: 'notify', messages: [raw] } }
+    end
+
+    it 'persists a single contact as a native contact attachment' do
+      params = contact_params({ contactMessage: { displayName: 'Algar', vcard: vcard } }, id: 'contact_1')
+
+      expect do
+        Whatsapp::IncomingMessageBaileysService.new(inbox: inbox, params: params).perform
+      end.to change(inbox.messages, :count).by(1)
+
+      message = inbox.messages.last
+      expect(message.is_unsupported).to be_falsey
+      expect(message.content).to eq('Algar - +55 34 9884-0123')
+      attachment = message.attachments.first
+      expect(attachment.file_type).to eq('contact')
+      expect(attachment.fallback_title).to eq('+55 34 9884-0123')
+      expect(attachment.meta).to eq('firstName' => 'Algar')
+    end
+
+    it 'creates one message per contact for a contactsArrayMessage (real shape)' do
+      other = "BEGIN:VCARD\nVERSION:3.0\nFN:+551140037752\nTEL;type=Mobile;waid=551140037752:+55 11 4003-7752\nEND:VCARD"
+      params = contact_params(
+        { contactsArrayMessage: { displayName: '2 contacts', contacts: [
+          { displayName: '+551140037752', vcard: other }, { displayName: 'Algar', vcard: vcard }
+        ] } },
+        id: 'contacts_array_1'
+      )
+
+      expect do
+        Whatsapp::IncomingMessageBaileysService.new(inbox: inbox, params: params).perform
+      end.to change(inbox.messages, :count).by(2)
+
+      messages = inbox.messages.last(2)
+      expect(messages.map { |m| m.attachments.first&.file_type }).to eq(%w[contact contact])
+      expect(messages.map(&:content)).to contain_exactly('+55 11 4003-7752', 'Algar - +55 34 9884-0123')
+    end
+  end
 end
