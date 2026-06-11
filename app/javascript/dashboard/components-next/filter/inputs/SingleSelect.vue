@@ -1,5 +1,5 @@
 <script setup>
-import { defineModel, computed, ref } from 'vue';
+import { computed, ref } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { useElementBounding, useWindowSize } from '@vueuse/core';
 import { picoSearch } from '@scmmishra/pico-search';
@@ -12,6 +12,8 @@ import DropdownItem from 'next/dropdown-menu/base/DropdownItem.vue';
 
 const {
   options,
+  asyncSearch,
+  isSearching,
   disableSearch,
   disableDeselect,
   placeholderIcon,
@@ -23,6 +25,14 @@ const {
   options: {
     type: Array,
     required: true,
+  },
+  asyncSearch: {
+    type: Boolean,
+    default: false,
+  },
+  isSearching: {
+    type: Boolean,
+    default: false,
   },
   disableSearch: {
     type: Boolean,
@@ -54,6 +64,12 @@ const {
   },
 });
 
+const emit = defineEmits(['search']);
+
+// the input is re-inserted on every dropdown open (v-if),
+// where the native autofocus attribute is ignored so focus it via a directive instead
+const vFocus = { mounted: el => el.focus() };
+
 const { t } = useI18n();
 const selected = defineModel({
   type: Object,
@@ -79,7 +95,9 @@ const dropdownPosition = computed(() => {
 });
 
 const searchTerm = ref('');
+
 const searchResults = computed(() => {
+  if (asyncSearch) return options;
   if (!options) return [];
   return picoSearch(options, searchTerm.value, ['name']);
 });
@@ -96,7 +114,11 @@ const selectedItem = computed(() => {
   if (!optionToSearch) return null;
   // extract the selected item from the options array
   // this ensures that options like icon is also included
-  return options.find(option => option.id === optionToSearch.id);
+  return (
+    options.find(option => option.id === optionToSearch.id) ||
+    // async options may not include the selected option, fall back to it
+    (asyncSearch && optionToSearch.id !== undefined ? optionToSearch : null)
+  );
 });
 
 const toggleSelected = option => {
@@ -157,13 +179,19 @@ const toggleSelected = option => {
         <Icon class="absolute size-4 left-2 top-2" icon="i-lucide-search" />
         <input
           v-model="searchTerm"
-          autofocus
+          v-focus
           class="p-1.5 pl-8 text-n-slate-11 bg-n-alpha-1 rounded-lg w-full"
           :placeholder="searchPlaceholder || t('COMBOBOX.SEARCH_PLACEHOLDER')"
+          @input="emit('search', $event.target.value)"
         />
       </div>
       <DropdownSection :height="dropdownMaxHeight">
-        <template v-if="searchResults.length">
+        <template v-if="isSearching">
+          <DropdownItem disabled>
+            {{ t('DROPDOWN_MENU.SEARCHING') }}
+          </DropdownItem>
+        </template>
+        <template v-else-if="searchResults.length">
           <DropdownItem
             v-for="option in searchResults"
             :key="option.id"
