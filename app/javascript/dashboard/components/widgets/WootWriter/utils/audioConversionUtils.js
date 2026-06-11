@@ -137,10 +137,7 @@ export const convertToMp3 = async (audioBlob, bitrate = 128) => {
 
 export const convertAudio = async (inputBlob, outputFormat, bitrate = 128) => {
   let audio;
-  if (outputFormat === 'audio/ogg') {
-    // Chrome produces WebM even when OGG is requested; remux to proper OGG/Opus
-    audio = await remuxWebmToOgg(inputBlob);
-  } else if (outputFormat === 'audio/wav') {
+  if (outputFormat === 'audio/wav') {
     audio = await convertToWav(inputBlob);
   } else if (outputFormat === 'audio/mp3') {
     audio = await convertToMp3(inputBlob, bitrate);
