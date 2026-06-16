@@ -37,7 +37,9 @@ When triggered on a merge, don't just read the file and wing it — walk the ful
 2. For every conflicted file: apply the **Per-file decision framework**, cross-referencing the **Recurring patterns** subsection for that file when one exists.
 3. Resolve and `git add` each file. Keep a running list of the KC/AI/CO/DEL decision per file (useful for the commit message and PR body).
 4. Run the **Validation flow** end-to-end (it is mandatory, not optional). Do not commit if any step fails.
-5. For Pro merges, recall that pushing to `chatwoot-pro/main` is directly followed by tagging `vX.Y.Z-fazer-ai-pro.N` and cutting a release — coordinate with the `release-notes` skill (and its `PRIVACY.md` companion) before writing the release body.
+5. Run the **Mandatory subagent review** (see section below) — it is a required gate, not optional. Address every FAIL before merging.
+6. Trigger the upstream CI on the branch (**Validate on upstream CI** section) and wait for green before merging.
+7. For Pro merges, recall that pushing to `chatwoot-pro/main` is directly followed by tagging `vX.Y.Z-fazer-ai-pro.N` and cutting a release — coordinate with the `release-notes` skill (and its `PRIVACY.md` companion) before writing the release body.
 
 ## Pre-flight
 
@@ -254,6 +256,25 @@ NODE_OPTIONS="--max-old-space-size=4096" npx vitest run \
 ```
 
 Keep the output around until after push — if CI fails, being able to compare local vs CI run saves a round trip.
+
+## Mandatory subagent review
+
+After the validation flow passes and the merge is committed, **spawn a panel of read-only subagents to independently verify the merge** before merging the PR. This is a required gate. Run them in parallel (one message, multiple `Agent` calls), each with a distinct lens, each returning a structured PASS/FAIL verdict with evidence. Hard constraints to put in EVERY agent prompt:
+
+- READ-ONLY: do not modify any file.
+- **Do NOT run `rails db:migrate` or `rails db:schema:dump`** — both auto-dump `db/schema.rb` from the local dev DB and would re-introduce kanban/Pro strays.
+- Tell each agent that HEAD may be one or more docs/follow-up commits ahead of the merge commit, so it should locate the actual merge commit and use its real parents (`^1` = fork side, `^2` = upstream side) rather than assuming `HEAD` is the merge.
+
+Minimum panel (scale up for big merges):
+
+1. **Schema integrity** — `grep -ic kanban db/schema.rb` is 0; `diff <(git show <merge>^1:db/schema.rb) db/schema.rb` shows ONLY this version's intended upstream additions (no stray tables); version stamp correct; fork tables + `f_unaccent` present; parses; no markers.
+2. **Per-file resolution correctness** — for each conflicted file, confirm both sides' intent is preserved per the directive (default: prefer fork, pull upstream improvements), `ruby -c`/parse passes, and a repo-wide `git grep` finds zero leftover conflict markers.
+3. **High-risk-area deep-dive** — the trickiest CO of this merge (often the WhatsApp incoming service / referral architecture): no orphaned or duplicated methods, all callers consistent, specs assert the fork's shape. Let this agent run the one or two light specs for that area.
+4. **Auto-merge semantic-breakage sweep** — THE class of bug the per-file review misses, because the break is in a file that auto-merged cleanly. Upstream renames/moves/removes a symbol, file, or component on its side; a fork file that auto-merged still references the old name → green textual merge, broken build. Have this agent hunt for: imports that no longer resolve (Vue/JS `import ... from` and Ruby `require`/constant refs), components/helpers/i18n keys referenced but renamed upstream, and method calls whose definition moved. Grep the merge diff for files upstream renamed/deleted, then grep the fork tree for stale references to them.
+
+> Real example (4.15.0): upstream #14741 renamed `shared/components/emoji/EmojiInput.vue` → `EmojiPicker.vue` and swapped its `:on-click` prop for a `select` event. The fork's `EmojiReactionPicker.vue` auto-merged with the stale import + prop. Zero conflict markers, clean rubocop/eslint-on-changed-files, all backend specs green — but the Vite transform broke every frontend spec that transitively imported it. Neither manual review nor a per-resolved-file subagent caught it; **only the frontend CI job did.** This is exactly why lenses #4 and the CI gate are both mandatory.
+
+The subagent panel COMPLEMENTS but never REPLACES the CI gate below — agents reason over source, CI actually builds and runs everything. Treat any agent FAIL as blocking, and never merge on a green panel with a red CI.
 
 ### Validate on upstream CI (GitHub Actions) before merging
 
